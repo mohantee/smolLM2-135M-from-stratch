@@ -6,6 +6,7 @@ import torch
 from transformers import AutoTokenizer
 from model import SmolLM, SmolConfig
 
+
 # ---------------------------------------------------------------------
 # Simple DataLoader
 # ---------------------------------------------------------------------
@@ -59,6 +60,7 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
 # Checkpoints
 # ---------------------------------------------------------------------
 def save_checkpoint(model, optimizer, step, loss, filepath, lr_config):
+    """Save FULL training checkpoint (model + optimizer)."""
     # ckpt = {
     #     "step": step,
     #     "loss": loss,
@@ -66,11 +68,12 @@ def save_checkpoint(model, optimizer, step, loss, filepath, lr_config):
     #     "optimizer_state": optimizer.state_dict(),
     #     "lr_config": lr_config,
     # }
-    torch.save(model.state_dict(), filepath)
+    torch.save(ckpt, filepath)
     print(f"\nSaved checkpoint: {filepath}")
 
 
 def load_checkpoint(filepath, device, model, optimizer):
+    """Load full training checkpoint."""
     ckpt = torch.load(filepath, map_location=device)
 
     model.load_state_dict(ckpt["model_state"])
@@ -113,7 +116,6 @@ def train(total_steps, ckpt_path, save_path, log_interval=100):
     )
 
     loader = DataLoaderLite(B=4, T=256)
-
     loss_fn = torch.nn.CrossEntropyLoss()
 
     # LR schedule settings
@@ -122,7 +124,6 @@ def train(total_steps, ckpt_path, save_path, log_interval=100):
     warmup_steps = 100
     original_max_steps = total_steps
 
-    # Resume?
     start_step = 0
     last_loss = None
     lr_config = {
@@ -132,42 +133,47 @@ def train(total_steps, ckpt_path, save_path, log_interval=100):
         "warmup_steps": warmup_steps,
     }
 
+    # --------------------------
+    # Resume From Checkpoint
+    # --------------------------
     if ckpt_path and os.path.exists(ckpt_path):
-        start_step, last_loss, old_lr_config = load_checkpoint(
+        loaded_step, last_loss, old_lr_cfg = load_checkpoint(
             ckpt_path, device, model, optimizer
         )
-        if old_lr_config and "original_max_steps" in old_lr_config:
-            original_max_steps = old_lr_config["original_max_steps"]
-            lr_config = old_lr_config
+
+        start_step = loaded_step + 1      # ← FIXED (resume from next step)
+
+        if old_lr_cfg and "original_max_steps" in old_lr_cfg:
+            original_max_steps = old_lr_cfg["original_max_steps"]
+            lr_config = old_lr_cfg
+
         print(f"Resuming from step {start_step}")
 
     print(f"\nTraining from step {start_step} → {total_steps}")
     print(f"LR schedule enabled (max={max_lr}, min={min_lr})")
     print(f"Using max_steps={original_max_steps} for LR\n")
 
-    # -------------------------------
-    # Main Training Loop
-    # -------------------------------
+    # --------------------------
+    # Main Loop
+    # --------------------------
     loss = torch.tensor(0.0, device=device)
+
     for step in range(start_step, total_steps):
         t0 = time.time()
 
-        # LR schedule update
+        # LR update
         lr = get_lr(step, warmup_steps, original_max_steps, max_lr, min_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # Next batch
         x, y = loader.next_batch()
         x, y = x.to(device), y.to(device)
 
         optimizer.zero_grad()
 
-        # Forward
         logits = model(x)
         loss = loss_fn(logits.view(-1, config.vocab_size), y.view(-1))
 
-        # Backprop
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -175,13 +181,12 @@ def train(total_steps, ckpt_path, save_path, log_interval=100):
         if device == "cuda":
             torch.cuda.synchronize()
 
-        t1 = time.time()
-        tok_per_sec = (loader.B * loader.T) / (t1 - t0)
-
         if step % log_interval == 0:
+            t1 = time.time()
+            tok_per_sec = (loader.B * loader.T) / (t1 - t0)
             print(f"step {step} | loss {loss.item():.4f} | lr {lr:.6f} | tok/s {tok_per_sec:8.1f}")
 
-        # Save checkpoint periodically
+        # Save every 1000 steps
         if step > 0 and step % 1000 == 0:
             ckpt_name = f"checkpoint_step_{step}.pt"
             save_checkpoint(model, optimizer, step, loss.item(), ckpt_name, lr_config)
@@ -190,17 +195,16 @@ def train(total_steps, ckpt_path, save_path, log_interval=100):
     save_checkpoint(model, optimizer, total_steps, loss.item(), save_path, lr_config)
     print(f"\nFinal loss: {loss.item():.4f}")
     print(f"Model saved → {save_path}")
-    
+
 
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train SmolLM (steps-based)")
-
-    parser.add_argument("--steps", type=int, required=True, help="Total training steps")
-    parser.add_argument("--ckpt", type=str, default=None, help="Checkpoint to resume from")
-    parser.add_argument("--save", type=str, default="checkpoint_final.pt", help="Save path")
+    parser.add_argument("--steps", type=int, required=True)
+    parser.add_argument("--ckpt", type=str, default=None)
+    parser.add_argument("--save", type=str, default="checkpoint_final.pt")
     parser.add_argument("--log-interval", type=int, default=100)
 
     args = parser.parse_args()
